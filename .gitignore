@@ -30,3 +30,7 @@
 *.exe
 *.out
 *.app
+inno
+
+# Ide
+.vscode

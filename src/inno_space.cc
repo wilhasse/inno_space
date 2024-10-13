@@ -85,7 +85,11 @@ static void usage()
       );
 }
 
-
+ulint get_next_rec_offset(byte* rec, byte* page) {
+    ulint next_off = mach_read_from_2(rec - REC_NEXT);
+    ulint rec_offset = ((rec - page) + next_off) & (UNIV_PAGE_SIZE - 1);
+    return rec_offset;
+}
 
 void ShowFILHeader(uint32_t page_num, uint16_t* type) {
   printf("=========================%u's block==========================\n", page_num);
@@ -216,131 +220,107 @@ int rec_init_offsets() {
   return 0;
 }
 
-void ShowRecord(rec_t *rec) {
-  ulint heap_no = rec_get_bit_field_2(rec, REC_NEW_HEAP_NO, REC_HEAP_NO_MASK, REC_HEAP_NO_SHIFT);
-  printf("heap no %u\n", heap_no);
-  printf("rec status %u\n", rec_get_status(rec));
-
-  if (rec_get_status(rec) >= 2 || heap_no == 1) return;
-
-  ulint is_delete = rec_get_bit_field_1(rec, REC_NEW_INFO_BITS, REC_INFO_DELETED_FLAG,
-                                      REC_INFO_BITS_SHIFT);
-  ulint is_min_record = rec_get_bit_field_1(rec, REC_NEW_INFO_BITS, REC_INFO_MIN_REC_FLAG,
-                                      REC_INFO_BITS_SHIFT);
-  
-  printf("Info Flags: is_deleted %d is_min_record %d\n", is_delete, is_min_record); 
-
-  printf("%s: ", dict_cols[3].col_name.c_str());
-  if (dict_cols[3].column_type_utf8 == "int") {
-    printf("%u ", (mach_read_from_4(rec) ^ 0x80000000));
-  } else {
-    printf("%.*s", dict_cols[3].char_length, rec);
-  }
-  printf("\n");
-
-  for (uint32_t i = 1; i < offsets_[1] - 2; i++) {
-    printf("%s: ", dict_cols[i + 5].col_name.c_str());
-    if (dict_cols[i + 5].column_type_utf8 == "int") {
-      printf("%u ", (mach_read_from_4(rec + offsets_[i + 4]) ^ 0x80000000));
-    } else {
-      printf("%.*s", dict_cols[i + 5].char_length, rec + offsets_[i + 4]);
-    }
-    printf("\n");
-  }
-
+ulint rec_get_heap_no(rec_t* rec) {
+    // In the compact page format, the heap number is stored in the record's header
+    // Retrieve the heap number from the record's header
+    return rec_get_bit_field_2(rec, REC_NEW_HEAP_NO, REC_HEAP_NO_MASK, REC_HEAP_NO_SHIFT);
 }
 
+#include <inttypes.h>  // Include for PRIu64
+
+void ShowRecord(rec_t* rec) {
+    ulint heap_no = rec_get_heap_no(rec);
+
+    // Define REC_HEAP_NO_INFIMUM and REC_HEAP_NO_SUPREMUM if not already defined
+    #define REC_HEAP_NO_INFIMUM 0   // Heap number for infimum record
+    #define REC_HEAP_NO_SUPREMUM 1  // Heap number for supremum record
+
+    if (rec_get_status(rec) >= REC_STATUS_NODE_PTR || heap_no == REC_HEAP_NO_INFIMUM || heap_no == REC_HEAP_NO_SUPREMUM) {
+        // Skip infimum, supremum, and node pointer records
+        return;
+    }
+
+    byte* field_ptr = rec + REC_N_NEW_EXTRA_BYTES;
+
+    printf("Record:\n");
+
+    // Loop over the columns in the record
+    for (size_t i = 0; i < dict_cols.size(); ++i) {
+        printf("  %s: ", dict_cols[i].col_name.c_str());
+
+        if (dict_cols[i].column_type_utf8 == "int") {
+            uint32_t value = mach_read_from_4(field_ptr) ^ 0x80000000;
+            printf("%d", (int32_t)value); // Cast to signed int if necessary
+            field_ptr += 4;
+        } else if (dict_cols[i].column_type_utf8 == "smallint") {
+            uint16_t value = mach_read_from_2(field_ptr) ^ 0x8000;
+            printf("%d", (int16_t)value); // Cast to signed short if necessary
+            field_ptr += 2;
+        } else if (dict_cols[i].column_type_utf8 == "char") {
+            printf("%.*s", dict_cols[i].char_length, field_ptr);
+            field_ptr += dict_cols[i].char_length;
+        } else if (dict_cols[i].column_type_utf8 == "datetime") {
+            // Handle datetime conversion if necessary
+            uint64_t datetime_value = mach_read_from_8(field_ptr);
+            // Convert to readable datetime format
+            printf("%" PRIu64, datetime_value); // Use PRIu64 for portable printing
+            field_ptr += 8;
+        } else {
+            // Handle other data types as needed
+        }
+        printf("\n");
+    }
+}
 
 // void ShowCompressInfo(uint32_t page_num) {
-  
 
 // }
 
-void ShowIndexHeader(uint32_t page_num, bool is_show_records) {
-  printf("Index Header:\n");
-  uint64_t offset = (uint64_t)kPageSize * (uint64_t)page_num;
+void ShowIndexHeader(byte* page_buf, uint32_t page_num, bool is_show_records) {
+  printf("Index Header for page %u:\n", page_num);
 
-  int ret = pread(fd, read_buf, kPageSize, offset);
+  // Read page header information
+  uint16_t n_dir_slots = mach_read_from_2(page_buf + PAGE_HEADER + PAGE_N_DIR_SLOTS);
+  uint16_t garbage_space = mach_read_from_2(page_buf + PAGE_HEADER + PAGE_GARBAGE);
+  uint16_t n_heap = page_header_get_field(page_buf, PAGE_N_HEAP);
+  uint16_t n_recs = mach_read_from_2(page_buf + PAGE_HEADER + PAGE_N_RECS);
+  uint64_t max_trx_id = mach_read_from_8(page_buf + PAGE_HEADER + PAGE_MAX_TRX_ID);
+  uint16_t page_level = mach_read_from_2(page_buf + PAGE_HEADER + PAGE_LEVEL);
+  uint64_t index_id = mach_read_from_8(page_buf + PAGE_HEADER + PAGE_INDEX_ID);
 
-  if (ret == -1) {
-    printf("ShowIndexHeader read error %d, is_show_records %d\n",
-           ret, is_show_records);
-    return;
-  }
+  printf("Number of Directory Slots: %hu\n", n_dir_slots);
+  printf("Garbage Space: %hu\n", garbage_space);
+  printf("Number of Heap Records: %hu\n", n_heap);
+  printf("Number of Records: %hu\n", n_recs);
+  printf("Max Trx id: %lu\n", max_trx_id);
+  printf("Page level: %hu\n", page_level);
+  printf("Index ID: %lu\n", index_id);
 
-  printf("Number of Directory Slots: %hu\n", mach_read_from_2(read_buf + PAGE_HEADER));
-  printf("Garbage Space: %hu\n", mach_read_from_2(read_buf + PAGE_HEADER + PAGE_GARBAGE));
-  printf("Number of Head Records: %hu\n", page_dir_get_n_heap(read_buf));
-  printf("Number of Records: %hu\n", mach_read_from_2(read_buf + PAGE_HEADER + PAGE_N_RECS));
-  printf("Max Trx id: %lu\n", mach_read_from_8(read_buf + PAGE_HEADER + PAGE_MAX_TRX_ID));
-  printf("Page level: %hu\n", mach_read_from_2(read_buf + PAGE_HEADER + PAGE_LEVEL));
-  printf("Index ID: %lu\n", mach_read_from_8(read_buf + PAGE_HEADER + PAGE_INDEX_ID));
-
-  bool has_symbol_table = (page_header_get_field(read_buf, PAGE_N_HEAP) & PAGE_HAS_SYMBOL_TABLE);
-  if (has_symbol_table) {
-    byte *base_ptr = read_buf + PAGE_NEW_SUPREMUM_END;
-    byte magic = mach_read_from_1(base_ptr + PAGE_SYMBOL_TABLE_MAGIC);
-    if (magic != PAGE_SYMBOL_TABLE_HEADER_MAGIC) {
-      return ;
-    }
-    uint8_t base_type = mach_read_from_1(base_ptr + PAGE_SYMBOL_TABLE_TYPE);
-    uint16_t n_bytes = mach_read_from_2(base_ptr + PAGE_SYMBOL_TABLE_N_BYTES);
-    uint8_t n_slots = mach_read_from_1(base_ptr + PAGE_SYMBOL_TABLE_N_SLOTS);
-    printf("magic %u, base_type %u, n_bytes %hu, n_slots %u\n", magic, base_type, n_bytes, n_slots); 
-    uint16_t prev_page_base_offset = mach_read_from_2(base_ptr + 
-            PAGE_SYMBOL_TABLE_HEADER_SIZE);
-    printf("slot %d, offset %hu, data ", 0, prev_page_base_offset);
-    for (int i = 1; i < n_slots; i++) {
-      uint16_t slot_i_offset = mach_read_from_2(base_ptr + 
-            PAGE_SYMBOL_TABLE_HEADER_SIZE + i * PAGE_SYMBOL_TABLE_SLOT_SIZE);
-      for (uint16_t j = 0; j < (slot_i_offset - prev_page_base_offset); j++) {
-        printf("%c",mach_read_from_1(base_ptr + prev_page_base_offset + j));
-      }
-      prev_page_base_offset = slot_i_offset;
-      printf("\n");
-      printf("slot %d, size %hu, data ", i, slot_i_offset);
-    }
-
-    for (uint16_t j = 0; j < (n_bytes - prev_page_base_offset); j++) {
-      printf("%c",mach_read_from_1(base_ptr + prev_page_base_offset + j));
-    }
-    printf("\n");
-  }
-  
-  uint16_t page_type = mach_read_from_2(read_buf + FIL_PAGE_TYPE);
-  if (page_type != FIL_PAGE_INDEX || is_show_records == false) {
-    return;
-  }
-  
+  // Optionally, handle symbol table if necessary
+  // ...
   rec_init_offsets();
-  byte *rec_ptr = read_buf + PAGE_NEW_INFIMUM;
-  // printf("page_rec_is_infimum_low %d page_rec_is_supremum_low %d\n", page_rec_is_infimum_low(PAGE_NEW_INFIMUM), page_rec_is_supremum_low(PAGE_NEW_SUPREMUM));
-  // printf("infimum %d\n", PAGE_NEW_INFIMUM);
-  // printf("supremum %d\n", PAGE_NEW_SUPREMUM);
-  return ;
-  while (1) {
-    printf("\n");
-    // offset from previous record
-    ulint off = mach_read_from_2(rec_ptr - REC_NEXT); 
-    // off = (((ulong)((rec_ptr + off))) & (UNIV_PAGE_SIZE - 1));
-    printf("offset from previous record %hu\n", off);
-    // off can't be negative, if the next record is less than current record
-    // the rec_ptr + off will > 16kb
-    // and the result & (UNIV_PAGE_SIZE - 1) will be less then current position
-    // after this, off is offset inside page offset
-    off = (((ulong)((rec_ptr + off))) & (UNIV_PAGE_SIZE - 1));
-    printf("offset inside page %hu\n", off);
-    // handle supremum
-    // https://raw.githubusercontent.com/baotiao/bb/main/uPic/image-20211212031146188.png
-    // off == 0 mean this is SUPREMUM record
-    if (page_rec_is_supremum_low(off)) {
-      break;
-    }
-    rec_ptr = read_buf + off;
-    ShowRecord(rec_ptr);
-    printf("\n");
+
+  uint16_t page_type = mach_read_from_2(page_buf + FIL_PAGE_TYPE);
+  if (page_type != FIL_PAGE_INDEX || !is_show_records) {
+    return;
   }
 
+  // Now iterate over the records in the page
+  byte* rec_ptr = page_buf + PAGE_NEW_INFIMUM;
+
+  // Get the offset to the first user record after infimum
+  ulint rec_offset = get_next_rec_offset(rec_ptr, page_buf);
+
+  // Iterate over all records until we reach the supremum record
+  while (rec_offset != PAGE_NEW_SUPREMUM) {
+    rec_ptr = page_buf + rec_offset;
+
+    // Process the record
+    ShowRecord(rec_ptr);
+
+    // Get the offset to the next record
+    rec_offset = get_next_rec_offset(rec_ptr, page_buf);
+  }
 }
 
 void ShowBlobHeader(uint32_t page_num) {
@@ -490,7 +470,7 @@ void ShowFile() {
     } else if (type == FIL_PAGE_TYPE_RSEG_ARRAY) {
       ShowRsegArray(i);
     } else {
-      ShowIndexHeader(i, 0);
+//      ShowIndexHeader(i, 0);
     }
   }
 }
@@ -1046,66 +1026,41 @@ void ShowIndexSummary() {
   return;
 }
 
+void ProcessPage(byte* page_buf, uint32_t page_num) {
+    uint16_t page_type = mach_read_from_2(page_buf + FIL_PAGE_TYPE);
+
+    // Only process index pages
+    if (page_type == FIL_PAGE_INDEX) {
+        uint16_t page_level = mach_read_from_2(page_buf + PAGE_HEADER + PAGE_LEVEL);
+
+        // Only process leaf pages (level 0)
+        if (page_level == 0) {
+            // Extract records from the leaf page
+            ShowIndexHeader(page_buf, page_num, true);
+        }
+    }
+}
+
 void DumpAllRecords() {
-  // first primary index root page always in page 4
-  // we have other way to find it, for simplicy dirctly assign it to 4
-  uint32_t root_page_id = 4;
+    // Get the file size
+    off_t file_size = lseek(fd, 0, SEEK_END);
+    lseek(fd, 0, SEEK_SET);
 
-  uint64_t offset = (uint64_t)kPageSize * (uint64_t)root_page_id;
+    // Calculate the total number of pages
+    uint32_t total_pages = file_size / kPageSize;
 
-  int ret = pread(fd, read_buf, kPageSize, offset);
-  if (ret == -1) {
-    printf("DumpAllRecords read error %d\n", ret);
-    return;
-  }
-  uint16_t page_level = mach_read_from_2(read_buf + PAGE_HEADER + PAGE_LEVEL);
-  // Reach leftmost leaf page
+    for (uint32_t page_num = 0; page_num < total_pages; ++page_num) {
+        uint64_t offset = static_cast<uint64_t>(kPageSize) * page_num;
 
-  std::cout << page_level << std::endl;
-  uint32_t curr_page = root_page_id;
-  while (1) {
-    printf("curr_page %u %hu\n", curr_page, page_level);
-    byte *rec_ptr = read_buf + PAGE_NEW_INFIMUM;
-    ulint off = mach_read_from_2(rec_ptr - REC_NEXT); 
+        int ret = pread(fd, read_buf, kPageSize, offset);
+        if (ret == -1) {
+            printf("DumpAllRecords read error %d\n", errno);
+            return;
+        }
 
-    page_no_t child_page_num =
-        mach_read_from_4(rec_ptr + off + 4);
-
-    printf("Next leftmost child page number is %u\n", child_page_num);
-    uint64_t curr_page_level = page_level;
-
-    offset = (uint64_t)kPageSize * (uint64_t)child_page_num;
-
-    ret = pread(fd, read_buf, kPageSize, offset);
-    if (ret == -1) {
-      printf("DumpAllRecords read error %d\n", errno);
-      return;
+        // Process the page
+        ProcessPage(read_buf, page_num);
     }
-    if (page_level == 0) {
-      break;
-    }
-    page_level = mach_read_from_2(read_buf + PAGE_HEADER + PAGE_LEVEL);
-    if (page_level != curr_page_level - 1) {
-      break;
-    }
-
-    curr_page = child_page_num;
-  }
-  uint32_t next_page = 0;
-  while (next_page != 4294967295) {
-    ShowIndexHeader(curr_page, true);
-    next_page = mach_read_from_4(read_buf + FIL_PAGE_NEXT);
-    printf("Next Page: %u\n", mach_read_from_4(read_buf + FIL_PAGE_NEXT));
-
-    curr_page = next_page;
-    offset = (uint64_t)kPageSize * (uint64_t)curr_page;
-
-    ret = pread(fd, read_buf, kPageSize, offset);
-    if (ret == -1) {
-      printf("DumpAllRecords read error %d\n", errno);
-      return;
-    }
-  }
 }
 
 void ShowSpaceIndexs() {
@@ -1229,7 +1184,7 @@ int main(int argc, char *argv[]) {
     } else if (type == FIL_PAGE_TYPE_RSEG_ARRAY) {
       ShowRsegArray(user_page);
     } else {
-      ShowIndexHeader(user_page, is_show_records);
+     // ShowIndexHeader(user_page, is_show_records);
     }
   }
 
