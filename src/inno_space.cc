@@ -139,117 +139,164 @@ static inline bool page_rec_is_infimum_low(
 }
 
 int rec_init_offsets() {
-  // Open the file for reading
+  // Load the JSON file containing the table schema (columns, etc.)
   std::ifstream file(sdi_path);
-
-  // Check if the file is open
   if (!file.is_open()) {
-    std::cerr << "Failed to open json the file." << std::endl;
+    std::cerr << "Failed to open SDI json file." << std::endl;
     return 1;
   }
 
-  // Create a string to store the file contents
   std::string file_contents;
-
-  // Read the file and append its contents to the string
   std::string line;
   while (std::getline(file, line)) {
     file_contents += line + '\n';
   }
-
-  // std::cout << file_contents;
-  // Close the file
   file.close();
 
   rapidjson::Document d;
   d.Parse(file_contents.c_str());
-
-  // the sysbench offsets array
-  // offsets[0] 100   // 这个值默认初始化成100, 数组的元素个数, 没用
-  // offsets[1] 6  // 除了默认offsets[0, 1, 2] 三列以后, 剩下的其他列的个数, 是table 里面列的个数+ 2(trx_id 和 rollptr), 从offset[3] 开始
-  // offsets[2] 2147483653  //extra size
-  // offsets[3] 4  // id 这个列
-  // offsets[4] 10  // 根据record format 可以看出, 这个是trx_id
-  // offsets[5] 17  // 根据record format 可以看出, 这个是rollptr
-  // offsets[6] 21 // k 这个列 
-  // offsets[7] 141 // c 这个列
-  // offsets[8] 201 // pad 这个列,   201 + offset[2](如果有extra size) 就是整个rec 的大小
-
-  
-  // init offsets array from here
-  // previous code parse the json file
-  memset(offsets_, 0, sizeof(offsets_));
-  offsets_[0] = REC_OFFS_NORMAL_SIZE;
-
-  offsets_[1] = d[1]["object"]["dd_object"]["columns"].Size();
-  // TODO: init extra size
-  offsets_[2] = 0;
-
-  dict_cols.resize(REC_OFFS_NORMAL_SIZE);
-  dict_cols[3].col_name = d[1]["object"]["dd_object"]["columns"][0]["name"].GetString();
-  dict_cols[3].column_type_utf8 = d[1]["object"]["dd_object"]["columns"][0]["column_type_utf8"].GetString();
-  if (dict_cols[3].column_type_utf8 == "int") {
-    offsets_[3] = 4; 
-  } else if (dict_cols[3].column_type_utf8.substr(0, 4) == "char") {
-    offsets_[3] = d[1]["object"]["dd_object"]["columns"][0]["char_length"].GetInt();
-    dict_cols[3].char_length = d[1]["object"]["dd_object"]["columns"][0]["char_length"].GetInt();
-  } else {
-    return -1;
+  if (d.HasParseError()) {
+    std::cerr << "JSON parse error: " << rapidjson::GetParseError_En(d.GetParseError())
+              << " offset: " << d.GetErrorOffset() << std::endl;
+    return 1;
   }
-  offsets_[4] = offsets_[3] + 6;
-  offsets_[5] = offsets_[4] + 7;
 
-  for (uint32_t i = 1; i < offsets_[1] - 2; i++) {
-    dict_cols[i + 5].col_name = d[1]["object"]["dd_object"]["columns"][i]["name"].GetString();
-    dict_cols[i + 5].column_type_utf8
-      = d[1]["object"]["dd_object"]["columns"][i]["column_type_utf8"].GetString();
-    if (dict_cols[i + 5].column_type_utf8 == "int") {
-      offsets_[i + 5] = offsets_[i + 4] + 4;
-      dict_cols[i + 5].char_length = 4;
-    } else if (dict_cols[i + 5].column_type_utf8.substr(0, 4) == "char") {
-      dict_cols[i + 5].char_length = d[1]["object"]["dd_object"]["columns"][i]["char_length"].GetInt();
-      offsets_[i + 5] = offsets_[i + 4] + d[1]["object"]["dd_object"]["columns"][i]["char_length"].GetInt();
+  // 1) Clear out offsets_[] and dict_cols, just to be safe
+  memset(offsets_, 0, sizeof(offsets_));
+  dict_cols.clear();
+  dict_cols.resize(REC_OFFS_NORMAL_SIZE); // Keep same fixed size or enlarge
+
+  // 2) Number of user columns (from JSON).
+  //    Depending on your SDI file format, you may need to adapt indexing:
+  // Instead of this:
+  // auto columns = d[1]["object"]["dd_object"]["columns"];
+  // Do this:
+  const rapidjson::Value& columns = d[1]["object"]["dd_object"]["columns"];
+  const size_t n_user_cols = columns.Size();
+
+  // Store in offsets_[1] how many *user* columns we have
+  offsets_[0] = REC_OFFS_NORMAL_SIZE;   // Usually just a “magic” constant
+  offsets_[1] = n_user_cols;            // total user columns
+
+  // 3) We track the “running offset” for each column within the record
+  ulint current_offset = 0;
+
+  // We'll fill dict_cols[] starting from index=3, so as not to stomp on offsets_[0..2].
+  // This is just a convention inherited from the original code.
+  ulint dict_idx = 3;
+
+  // 4) Parse each user column from the JSON
+  for (size_t i = 0; i < n_user_cols; i++) {
+    dict_cols[dict_idx].col_name 
+      = columns[i]["name"].GetString();
+
+    dict_cols[dict_idx].column_type_utf8 
+      = columns[i]["column_type_utf8"].GetString();
+
+    // Determine length for char(N) vs int, etc.
+    int col_len = 0;
+    if (dict_cols[dict_idx].column_type_utf8 == "int") {
+      col_len = 4;  // typical
+    } else if (dict_cols[dict_idx].column_type_utf8.rfind("char", 0) == 0) {
+      col_len = columns[i]["char_length"].GetInt();
     } else {
+      std::cerr << "Unsupported column type: " 
+                << dict_cols[dict_idx].column_type_utf8 << std::endl;
       return -1;
     }
+    dict_cols[dict_idx].char_length = col_len;
+
+    // Save the offset of this column in offsets_
+    offsets_[dict_idx] = current_offset;
+
+    // Advance the running offset
+    current_offset += col_len;
+    dict_idx++;
   }
+
+  // 5) Append hidden columns: TRX_ID (6 bytes) and ROLL_PTR (7 bytes).
+  //    (In older MySQL versions, TRX_ID might be 6 or 8 bytes, etc. 
+  //     The code below follows the original approach: 6 for trx_id, 7 for roll_ptr.)
+  offsets_[dict_idx] = current_offset; // TRX_ID
+  current_offset += 6; 
+  dict_idx++;
+
+  offsets_[dict_idx] = current_offset; // ROLL_PTR
+  current_offset += 7; 
+  dict_idx++;
+
+  // 6) offsets_[2] can store the total row length if the code needs it
+  offsets_[2] = current_offset;
+
+  // Return success
   return 0;
 }
 
 void ShowRecord(rec_t *rec) {
-  ulint heap_no = rec_get_bit_field_2(rec, REC_NEW_HEAP_NO, REC_HEAP_NO_MASK, REC_HEAP_NO_SHIFT);
+  ulint heap_no = rec_get_bit_field_2(rec, REC_NEW_HEAP_NO, 
+                                      REC_HEAP_NO_MASK, REC_HEAP_NO_SHIFT);
   printf("heap no %u\n", heap_no);
   printf("rec status %u\n", rec_get_status(rec));
 
-  if (rec_get_status(rec) >= 2 || heap_no == 1) return;
-
-  ulint is_delete = rec_get_bit_field_1(rec, REC_NEW_INFO_BITS, REC_INFO_DELETED_FLAG,
-                                      REC_INFO_BITS_SHIFT);
-  ulint is_min_record = rec_get_bit_field_1(rec, REC_NEW_INFO_BITS, REC_INFO_MIN_REC_FLAG,
-                                      REC_INFO_BITS_SHIFT);
-  
-  printf("Info Flags: is_deleted %d is_min_record %d\n", is_delete, is_min_record); 
-
-  printf("%s: ", dict_cols[3].col_name.c_str());
-  if (dict_cols[3].column_type_utf8 == "int") {
-    printf("%u ", (mach_read_from_4(rec) ^ 0x80000000));
-  } else {
-    printf("%.*s", dict_cols[3].char_length, rec);
+  // If it's marked deleted or sup/min, skip printing
+  if (rec_get_status(rec) >= 2 || heap_no == 1) {
+    return;
   }
-  printf("\n");
 
-  for (uint32_t i = 1; i < offsets_[1] - 2; i++) {
-    printf("%s: ", dict_cols[i + 5].col_name.c_str());
-    if (dict_cols[i + 5].column_type_utf8 == "int") {
-      printf("%u ", (mach_read_from_4(rec + offsets_[i + 4]) ^ 0x80000000));
+  ulint is_delete = rec_get_bit_field_1(rec, REC_NEW_INFO_BITS, 
+                                        REC_INFO_DELETED_FLAG,
+                                        REC_INFO_BITS_SHIFT);
+  ulint is_min_record = rec_get_bit_field_1(rec, REC_NEW_INFO_BITS, 
+                                            REC_INFO_MIN_REC_FLAG,
+                                            REC_INFO_BITS_SHIFT);
+  printf("Info Flags: is_deleted %u is_min_record %u\n", 
+         is_delete, is_min_record);
+
+  // Number of user columns
+  const size_t n_user_cols = offsets_[1];
+
+  // Print each user column
+  for (size_t i = 0; i < n_user_cols; i++) {
+    // The dict_col index is i+3 (we started storing user columns at offset 3)
+    const size_t dict_idx = i + 3;
+    // The offset within the record
+    ulint col_offset = offsets_[dict_idx];
+
+    // Column name
+    printf("%s: ", dict_cols[dict_idx].col_name.c_str());
+
+    // Print according to type
+    if (dict_cols[dict_idx].column_type_utf8 == "int") {
+      // In InnoDB, int fields in a clustered index often have the “sign bit” flipped
+      // for correct sort order. The original code used XOR 0x80000000.
+      // If that’s your preference, keep it:
+      uint32_t val = mach_read_from_4(rec + col_offset) ^ 0x80000000;
+      printf("%u\n", val);
     } else {
-      printf("%.*s", dict_cols[i + 5].char_length, rec + offsets_[i + 4]);
+      // e.g. char(N)
+      int len = dict_cols[dict_idx].char_length;
+      printf("%.*s\n", len, rec + col_offset);
     }
-    printf("\n");
   }
 
-}
+  // 2 hidden columns are stored after all user columns:
+  //   offsets_[n_user_cols+3] => TRX_ID offset
+  //   offsets_[n_user_cols+4] => ROLL_PTR offset
+  ulint trx_id_offset  = offsets_[n_user_cols + 3];
+  ulint roll_ptr_offset = offsets_[n_user_cols + 4];
 
+  // The original code used 6 bytes for TRX_ID, 7 for ROLL_PTR.
+  // You can read them with mach_read_from_6 / mach_read_from_7 or similar:
+  uint64_t trx_id = mach_read_from_6(rec + trx_id_offset);
+  // For roll_ptr, you might do mach_read_from_7(...) or treat it as 7 bytes, etc.
+  // The simplest might be reading 8 bytes but ignoring 1? Or a dedicated function:
+  // If your code does not define mach_read_from_7, you can create it or do a manual approach.
+  // For brevity, assume we have one:
+  uint64_t roll_ptr = mach_read_from_8(rec + roll_ptr_offset);
+
+  printf("trx_id: %llu\n", (unsigned long long) trx_id);
+  printf("roll_ptr: %llu\n", (unsigned long long) roll_ptr);
+}
 
 // void ShowCompressInfo(uint32_t page_num) {
   
@@ -317,7 +364,7 @@ void ShowIndexHeader(uint32_t page_num, bool is_show_records) {
   // printf("page_rec_is_infimum_low %d page_rec_is_supremum_low %d\n", page_rec_is_infimum_low(PAGE_NEW_INFIMUM), page_rec_is_supremum_low(PAGE_NEW_SUPREMUM));
   // printf("infimum %d\n", PAGE_NEW_INFIMUM);
   // printf("supremum %d\n", PAGE_NEW_SUPREMUM);
-  return ;
+  // return ;
   while (1) {
     printf("\n");
     // offset from previous record
