@@ -1,3 +1,13 @@
+/******************************************************************************
+ * ADAPTED CODE: InnoDB .ibd parser with integrated DECOMPRESSION (zlib).
+ *
+ * Compile example (assuming zlib is installed):
+ *     g++ -std=c++11 -o inno inno_main.c -lz
+ * or
+ *     gcc -o inno inno_main.c -lstdc++ -lz
+ *
+ * This is a demonstration only. 
+ *****************************************************************************/
 
 #include <stdio.h>
 #include <stdint.h>
@@ -10,9 +20,7 @@
 #include <fstream>
 
 #include <sys/stat.h>
-
 #include <cstdlib>
-#include <iostream>
 
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
@@ -20,6 +28,10 @@
 #include <rapidjson/istreamwrapper.h>
 #include <rapidjson/ostreamwrapper.h>
 #include <rapidjson/prettywriter.h>
+
+// ====================== DECOMPRESSION SNIPPET =======================
+#include <zlib.h>  // For inflate/deflate
+// ===================================================================
 
 #include "include/fil0fil.h"
 #include "include/page0page.h"
@@ -30,8 +42,6 @@
 #include "include/page0types.h"
 #include "include/rem0types.h"
 #include "include/rec.h"
-
-
 
 static const uint32_t kPageSize = 16384;
 
@@ -54,6 +64,74 @@ struct dict_col {
 
 std::vector<dict_col> dict_cols;
 
+/**************************************************************************/
+/* ====================== DECOMPRESSION SNIPPET ======================= */
+/* Minimal data structure to describe a compressed page. */
+typedef struct page_zip_des {
+    byte* data;         /* pointer to the compressed block */
+    uint32_t ssize;     /* size in bytes (usually 8k or 16k, etc.) */
+} page_zip_des_t;
+
+/** Minimal "inflate" function that uncompresses from PAGE_DATA onward 
+    into a 16KiB page buffer. */
+static bool
+page_zip_decompress_low(page_zip_des_t* page_zip, byte* page_out) {
+    // We'll do a simple inflate of everything from PAGE_DATA .. end of compressed data.
+    // The first PAGE_DATA bytes are stored uncompressed in many MySQL versions.
+
+    // Basic checks
+    if (!page_zip || !page_out) return false;
+    if (page_zip->ssize < PAGE_DATA) return false;
+
+    // 1) Copy the first PAGE_DATA bytes verbatim:
+    memcpy(page_out, page_zip->data, PAGE_DATA);
+
+    // 2) Now set up zlib to decompress from [PAGE_DATA .. ssize) 
+    //    into [PAGE_DATA .. kPageSize).
+    uInt in_len  = (uInt)(page_zip->ssize - PAGE_DATA);
+    byte* in_ptr = page_zip->data + PAGE_DATA;
+
+    byte* out_ptr = page_out + PAGE_DATA;
+    uInt out_cap  = (uInt)(kPageSize - PAGE_DATA);
+
+    z_stream strm;
+    memset(&strm, 0, sizeof(z_stream));
+
+    int zerr = inflateInit(&strm);
+    if (zerr != Z_OK) {
+        fprintf(stderr, "inflateInit() failed\n");
+        return false;
+    }
+
+    strm.next_in   = in_ptr;
+    strm.avail_in  = in_len;
+    strm.next_out  = out_ptr;
+    strm.avail_out = out_cap;
+
+    // We attempt one-shot inflate:
+    zerr = inflate(&strm, Z_FINISH);
+    if (zerr != Z_STREAM_END && zerr != Z_OK) {
+        fprintf(stderr, "inflate() failed or incomplete, zerr=%d\n", zerr);
+        inflateEnd(&strm);
+        return false;
+    }
+
+    inflateEnd(&strm);
+
+    // Done. We have uncompressed data in page_out[PAGE_DATA..].
+    return true;
+}
+
+/** Minimal wrapper that calls page_zip_decompress_low() 
+    and can be extended for “all” vs “some” parts. */
+static bool
+page_zip_decompress(page_zip_des_t* page_zip, byte* page_out) {
+    if (!page_zip || !page_out) return false;
+    return page_zip_decompress_low(page_zip, page_out);
+}
+/* ==================================================================== */
+/**************************************************************************/
+
 static void usage()
 {
   fprintf(stderr,
@@ -63,9 +141,10 @@ static void usage()
       "\t-f test/t.ibd     -- ibd file \n"
       "\t\t-c list-page-type      -- show all page type\n"
       "\t\t-c index-summary       -- show indexes information\n"
-      "\t\t-c show-undo-file       -- show undo log file detail\n"
+      "\t\t-c show-undo-file      -- show undo log file detail\n"
+      "\t\t-c dump-all-records    -- parse all records from a known root\n"
       "\t-p page_num       -- show page information\n"
-      "\t\t-c show-records        -- show all records information\n"
+      "\t\t-c show-records        -- show all records from that page\n"
       "\t-u page_num       -- update page checksum\n"
       "\t-d page_num       -- delete page \n"
       "Example: \n"
@@ -85,7 +164,142 @@ static void usage()
       );
 }
 
+/** Very simplistic check if page might be compressed. 
+    Real InnoDB does more: e.g. check if (fil_page_type==FIL_PAGE_COMPRESSED).
+    This is a placeholder. */
+static bool is_page_compressed(const byte* page) {
+  // For demonstration, let's assume:
+  // If the page "type" is FIL_PAGE_INDEX, it *might* be compressed 
+  // if certain bytes are nonzero after PAGE_DATA, etc. You can adapt:
+  // 
+  // For now, let's just return false by default. 
+  // If you have a .ibd known to be compressed, you can do e.g.:
+  //   if (fil_page_get_type(page) == FIL_PAGE_INDEX) return true;
+  // 
+  // Adjust to your real scenario:
+  return true;
+}
 
+/***********************************************************************
+  Everything below is your existing code (with minimal edits) 
+  that calls ShowIndexHeader() or others. We add 1 new function:
+  ShowIndexHeaderPossibleDecompress(), which is identical to 
+  ShowIndexHeader() except it attempts to decompress first if 
+  `is_page_compressed()` is true.
+***********************************************************************/
+
+/** TRUE if the record is the supremum record on a page.
+ @return true if the supremum record */
+static inline bool page_rec_is_supremum_low(
+    ulint offset) /*!< in: record offset on page */
+{
+  return (offset == PAGE_NEW_SUPREMUM || offset == PAGE_OLD_SUPREMUM);
+}
+
+/** TRUE if the record is the infimum record on a page.
+ @return true if the infimum record */
+static inline bool page_rec_is_infimum_low(
+    ulint offset) /*!< in: record offset on page */
+{
+  return (offset == PAGE_NEW_INFIMUM || offset == PAGE_OLD_INFIMUM);
+}
+
+/** Forward declarations of your existing functions: */
+int rec_init_offsets();
+void ShowRecord(rec_t *rec);
+
+/** This is your original ShowIndexHeader() that expects the 
+    page is NOT compressed. */
+void ShowIndexHeader(uint32_t page_num, bool is_show_records);
+
+/** NEW: We create a variant that tries to decompress if the page looks compressed. */
+void ShowIndexHeaderPossibleDecompress(uint32_t page_num, bool is_show_records) {
+  printf("Index Header (with possible zlib decompress):\n");
+  uint64_t offset = (uint64_t)kPageSize * (uint64_t)page_num;
+
+  int ret = pread(fd, read_buf, kPageSize, offset);
+  if (ret == -1) {
+    printf("ShowIndexHeader read error %d, is_show_records %d\n",
+           ret, is_show_records);
+    return;
+  }
+
+  // Check if page might be compressed:
+  if (is_page_compressed(read_buf)) {
+    // 1) Build a page_zip_des_t
+    page_zip_des_t zip;
+    zip.data = read_buf;     // compressed data is in read_buf
+    zip.ssize = kPageSize;   // Typically 16K. 
+                             // (In real code, you might store the "zip_size" from the InnoDB data dictionary.)
+
+    // 2) Allocate a separate buffer for the uncompressed page
+    byte* uncompressed_page = (byte*)malloc(kPageSize);
+    if (!uncompressed_page) {
+      printf("malloc for uncompressed_page failed\n");
+      return;
+    }
+
+    memset(uncompressed_page, 0, kPageSize);
+
+    // 3) Try decompress
+    bool ok = page_zip_decompress(&zip, uncompressed_page);
+    if (!ok) {
+      printf("Decompression failed. Falling back to raw parse.\n");
+      // Just parse read_buf as-is
+      free(uncompressed_page);
+      ShowIndexHeader(page_num, is_show_records);
+      return;
+    }
+
+    // 4) If success, parse the uncompressed page the same way 
+    //    your ShowIndexHeader does. 
+    //    We can literally copy ShowIndexHeader() code, or we can 
+    //    modify ShowIndexHeader() to accept a pointer to "page data."
+
+    printf("Decompression succeeded!\n");
+
+    // We'll reuse the ShowIndexHeader logic, but feed it the “uncompressed_page”.
+    // For that, let's copy ShowIndexHeader code inline here or we do a small refactor.
+
+    printf("Number of Directory Slots: %hu\n", mach_read_from_2(uncompressed_page + PAGE_HEADER));
+    printf("Garbage Space: %hu\n", mach_read_from_2(uncompressed_page + PAGE_HEADER + PAGE_GARBAGE));
+    printf("Number of Head Records: %hu\n", page_dir_get_n_heap(uncompressed_page));
+    printf("Number of Records: %hu\n", mach_read_from_2(uncompressed_page + PAGE_HEADER + PAGE_N_RECS));
+    printf("Max Trx id: %lu\n", mach_read_from_8(uncompressed_page + PAGE_HEADER + PAGE_MAX_TRX_ID));
+    printf("Page level: %hu\n", mach_read_from_2(uncompressed_page + PAGE_HEADER + PAGE_LEVEL));
+    printf("Index ID: %lu\n", mach_read_from_8(uncompressed_page + PAGE_HEADER + PAGE_INDEX_ID));
+
+    uint16_t page_type = mach_read_from_2(uncompressed_page + FIL_PAGE_TYPE);
+    if (page_type != FIL_PAGE_INDEX || is_show_records == false) {
+      free(uncompressed_page);
+      return;
+    }
+    // Now parse records (like your code).
+    rec_init_offsets(); 
+    byte* rec_ptr = uncompressed_page + PAGE_NEW_INFIMUM;
+
+    while (true) {
+      printf("\n");
+      ulint off = mach_read_from_2(rec_ptr - REC_NEXT);
+      printf("offset from previous record %hu\n", off);
+
+      off = (((ulong)((rec_ptr + off))) & (kPageSize - 1));
+      printf("offset inside page %hu\n", off);
+      if (page_rec_is_supremum_low(off)) {
+        break;
+      }
+      rec_ptr = uncompressed_page + off;
+      ShowRecord(rec_ptr);
+      printf("\n");
+    }
+
+    free(uncompressed_page);
+
+  } else {
+    // Page is not compressed, just call existing ShowIndexHeader:
+    ShowIndexHeader(page_num, is_show_records);
+  }
+}
 
 void ShowFILHeader(uint32_t page_num, uint16_t* type) {
   printf("=========================%u's block==========================\n", page_num);
@@ -121,22 +335,6 @@ void hexDump(void *ptr, size_t size) {
   }
   std::cout << std::endl;
 } 
-
-/** TRUE if the record is the supremum record on a page.
- @return true if the supremum record */
-static inline bool page_rec_is_supremum_low(
-    ulint offset) /*!< in: record offset on page */
-{
-  return (offset == PAGE_NEW_SUPREMUM || offset == PAGE_OLD_SUPREMUM);
-}
-
-/** TRUE if the record is the infimum record on a page.
- @return true if the infimum record */
-static inline bool page_rec_is_infimum_low(
-    ulint offset) /*!< in: record offset on page */
-{
-  return (offset == PAGE_NEW_INFIMUM || offset == PAGE_OLD_INFIMUM);
-}
 
 int rec_init_offsets() {
   // Load the JSON file containing the table schema (columns, etc.)

@@ -1,4 +1,3 @@
-
 CXX = g++
 CXXFLAGS = -Wall -W -DNDEBUG -g -O2 -std=c++11
 OBJECT = inno
@@ -19,9 +18,11 @@ OBJS = $(patsubst %.cc,%.o,$(BASE_BOJS))
 all: $(OBJECT)
 	rm $(SRC_DIR)/*.o
 
+# The top-level link rule (final link):
 $(OBJECT): $(OBJS)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(INCLUDE_PATH) $(LIB_PATH) $(LIBS)
+	$(CXX) $(CXXFLAGS) -o $@ $^ $(INCLUDE_PATH) $(LIB_PATH) $(LIBS) -lz
 
+# Compile rule (object files):
 %.o : %.cc
 	$(CXX) $(CXXFLAGS) -c $< -o $@ $(INCLUDE_PATH)
 
