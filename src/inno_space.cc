@@ -1292,65 +1292,125 @@ void ShowIndexSummary() {
 }
 
 void DumpAllRecords() {
-  // first primary index root page always in page 4
-  // we have other way to find it, for simplicy dirctly assign it to 4
-  uint32_t root_page_id = 4;
+    printf("=== [Debug] Entering DumpAllRecords() ===\n");
 
-  uint64_t offset = (uint64_t)kPageSize * (uint64_t)root_page_id;
+    // 1) We'll assume the primary index root is always page 4
+    uint32_t root_page_id = 4;
+    printf("[Debug] root_page_id = %u\n", root_page_id);
 
-  int ret = pread(fd, read_buf, kPageSize, offset);
-  if (ret == -1) {
-    printf("DumpAllRecords read error %d\n", ret);
-    return;
-  }
-  uint16_t page_level = mach_read_from_2(read_buf + PAGE_HEADER + PAGE_LEVEL);
-  // Reach leftmost leaf page
+    // 2) Calculate file offset of page 4
+    uint64_t offset = (uint64_t)kPageSize * (uint64_t)root_page_id;
+    printf("[Debug] reading from offset: %lu (page 4)\n", offset);
 
-  std::cout << page_level << std::endl;
-  uint32_t curr_page = root_page_id;
-  while (1) {
-    printf("curr_page %u %hu\n", curr_page, page_level);
-    byte *rec_ptr = read_buf + PAGE_NEW_INFIMUM;
-    ulint off = mach_read_from_2(rec_ptr - REC_NEXT); 
-
-    page_no_t child_page_num =
-        mach_read_from_4(rec_ptr + off + 4);
-
-    printf("Next leftmost child page number is %u\n", child_page_num);
-    uint64_t curr_page_level = page_level;
-
-    offset = (uint64_t)kPageSize * (uint64_t)child_page_num;
-
-    ret = pread(fd, read_buf, kPageSize, offset);
+    // 3) Read the page into read_buf
+    int ret = pread(fd, read_buf, kPageSize, offset);
     if (ret == -1) {
-      printf("DumpAllRecords read error %d\n", errno);
-      return;
+        printf("[ERROR] DumpAllRecords: pread() for root page failed\n");
+        return;
     }
-    if (page_level == 0) {
-      break;
-    }
-    page_level = mach_read_from_2(read_buf + PAGE_HEADER + PAGE_LEVEL);
-    if (page_level != curr_page_level - 1) {
-      break;
+    printf("[Debug] pread() returned %d bytes\n", ret);
+
+    // 4) Check the page type
+    uint16_t page_type = mach_read_from_2(read_buf + FIL_PAGE_TYPE);
+    printf("[Debug] page_type = %u\n", page_type);
+
+    // If it's not an index page, do not parse as if it's a B-tree
+    if (page_type != FIL_PAGE_INDEX) {
+        printf("[Warn] This is not an INDEX PAGE. Aborting record parse.\n");
+        return;
     }
 
-    curr_page = child_page_num;
-  }
-  uint32_t next_page = 0;
-  while (next_page != 4294967295) {
-    ShowIndexHeader(curr_page, true);
-    next_page = mach_read_from_4(read_buf + FIL_PAGE_NEXT);
-    printf("Next Page: %u\n", mach_read_from_4(read_buf + FIL_PAGE_NEXT));
+    // 5) Read the page level
+    uint16_t page_level = mach_read_from_2(read_buf + PAGE_HEADER + PAGE_LEVEL);
+    printf("[Debug] page_level = %hu\n", page_level);
 
-    curr_page = next_page;
-    offset = (uint64_t)kPageSize * (uint64_t)curr_page;
+    // Let's say we are doing a loop from the root down to leaf
+    // In your code, you might do something like a BFS or DFS to reach leaf pages.
+    // For demonstration, we do a single pass:
+    uint32_t curr_page = root_page_id;
 
-    ret = pread(fd, read_buf, kPageSize, offset);
-    if (ret == -1) {
-      printf("DumpAllRecords read error %d\n", errno);
-      return;
+    // 6) For debugging, just one iteration, or a while loop if needed
+    //    We'll show pointer math checks inside the loop
+    while (true) {
+        printf("[Debug] curr_page = %u, page_level = %hu\n", curr_page, page_level);
+
+        // The "infimum" record offset is PAGE_NEW_INFIMUM (commonly 99 in 16KB pages)
+        byte* rec_ptr = read_buf + PAGE_NEW_INFIMUM;
+        printf("[Debug] rec_ptr = %p (PAGE_NEW_INFIMUM=%d)\n",
+               (void*)rec_ptr, PAGE_NEW_INFIMUM);
+
+        // Safety check: ensure rec_ptr is still inside read_buf
+        if (rec_ptr < read_buf || rec_ptr >= read_buf + kPageSize) {
+            printf("[Error] rec_ptr is out of range! Aborting.\n");
+            break;
+        }
+
+        // We read REC_NEXT from the 2 bytes before rec_ptr
+        // i.e. rec_ptr - REC_NEXT. This is how InnoDB internally stores "next record" offset
+        // But let's do a boundary check first
+        if (rec_ptr < read_buf + REC_NEXT) {
+            printf("[Error] rec_ptr - REC_NEXT is out of bounds.\n");
+            break;
+        }
+
+        ulint off = mach_read_from_2(rec_ptr - REC_NEXT);
+        printf("[Debug] offset from previous record = %u\n", off);
+
+        // If offset is beyond page boundary, it is invalid.
+        if (off >= kPageSize) {
+            printf("[Error] offset %u >= kPageSize. Aborting.\n", off);
+            break;
+        }
+
+        // Calculate the "next record" pointer
+        byte* next_rec_ptr = rec_ptr + off;
+        printf("[Debug] next_rec_ptr = %p\n", (void*)next_rec_ptr);
+
+        // Check that next_rec_ptr is still inside [read_buf .. read_buf + kPageSize)
+        if (next_rec_ptr < read_buf || next_rec_ptr + 4 > read_buf + kPageSize) {
+            printf("[Error] next_rec_ptr out of range! Aborting.\n");
+            break;
+        }
+
+        // Suppose we interpret next_rec_ptr+4 as a child_page_num
+        uint32_t child_page_num = mach_read_from_4(next_rec_ptr + 4);
+        printf("[Debug] child_page_num=%u\n", child_page_num);
+
+        // If your code needs to read records (like ShowRecord(next_rec_ptr)), you can do it here:
+        // ShowRecord(next_rec_ptr);
+
+        // If page_level > 0, we might follow child_page_num as the next page to read
+        if (page_level > 0) {
+            printf("[Debug] Going down one level in the B-tree to page %u.\n", child_page_num);
+
+            // read the child page
+            uint64_t child_offset = (uint64_t)kPageSize * (uint64_t)child_page_num;
+            int ret2 = pread(fd, read_buf, kPageSize, child_offset);
+            if (ret2 == -1) {
+                printf("[ERROR] pread() for child page %u failed.\n", child_page_num);
+                break;
+            }
+            printf("[Debug] read child page %u successfully.\n", child_page_num);
+
+            // re-check the page type/level
+            page_type = mach_read_from_2(read_buf + FIL_PAGE_TYPE);
+            page_level = mach_read_from_2(read_buf + PAGE_HEADER + PAGE_LEVEL);
+            curr_page = child_page_num;
+
+            // Possibly continue the while loop to step further down
+            continue;
+        }
+
+        // If page_level == 0, we are at a leaf page
+        // Then you'd parse all the records in the leaf, maybe with ShowIndexHeader() or something
+        printf("[Debug] We are at a leaf page, parse all records here...\n");
+        // ShowIndexHeader(...) or your own leaf parse code
+
+        // For demonstration, let's just break
+        break;
     }
-  }
+
+    printf("=== [Debug] Exiting DumpAllRecords() ===\n");
 }
 
 void ShowSpaceIndexs() {
