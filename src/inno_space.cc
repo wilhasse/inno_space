@@ -31,6 +31,7 @@
 
 // ====================== DECOMPRESSION SNIPPET =======================
 #include <zlib.h>  // For inflate/deflate
+#include "zipdecompress_stub.h"
 // ===================================================================
 
 #include "include/fil0fil.h"
@@ -66,69 +67,12 @@ std::vector<dict_col> dict_cols;
 
 /**************************************************************************/
 /* ====================== DECOMPRESSION SNIPPET ======================= */
-/* Minimal data structure to describe a compressed page. */
-typedef struct page_zip_des {
-    byte* data;         /* pointer to the compressed block */
-    uint32_t ssize;     /* size in bytes (usually 8k or 16k, etc.) */
-} page_zip_des_t;
 
-/** Minimal "inflate" function that uncompresses from PAGE_DATA onward 
-    into a 16KiB page buffer. */
-static bool
-page_zip_decompress_low(page_zip_des_t* page_zip, byte* page_out) {
-    // We'll do a simple inflate of everything from PAGE_DATA .. end of compressed data.
-    // The first PAGE_DATA bytes are stored uncompressed in many MySQL versions.
-
-    // Basic checks
-    if (!page_zip || !page_out) return false;
-    if (page_zip->ssize < PAGE_DATA) return false;
-
-    // 1) Copy the first PAGE_DATA bytes verbatim:
-    memcpy(page_out, page_zip->data, PAGE_DATA);
-
-    // 2) Now set up zlib to decompress from [PAGE_DATA .. ssize) 
-    //    into [PAGE_DATA .. kPageSize).
-    uInt in_len  = (uInt)(page_zip->ssize - PAGE_DATA);
-    byte* in_ptr = page_zip->data + PAGE_DATA;
-
-    byte* out_ptr = page_out + PAGE_DATA;
-    uInt out_cap  = (uInt)(kPageSize - PAGE_DATA);
-
-    z_stream strm;
-    memset(&strm, 0, sizeof(z_stream));
-
-    int zerr = inflateInit(&strm);
-    if (zerr != Z_OK) {
-        fprintf(stderr, "inflateInit() failed\n");
-        return false;
-    }
-
-    strm.next_in   = in_ptr;
-    strm.avail_in  = in_len;
-    strm.next_out  = out_ptr;
-    strm.avail_out = out_cap;
-
-    // We attempt one-shot inflate:
-    zerr = inflate(&strm, Z_FINISH);
-    if (zerr != Z_STREAM_END && zerr != Z_OK) {
-        fprintf(stderr, "inflate() failed or incomplete, zerr=%d\n", zerr);
-        inflateEnd(&strm);
-        return false;
-    }
-
-    inflateEnd(&strm);
-
-    // Done. We have uncompressed data in page_out[PAGE_DATA..].
-    return true;
+static inline bool page_zip_decompress(page_zip_des_t* zip, byte* page_out) {
+  // Always pass false if you only want partial checks
+  return page_zip_decompress_low(zip, page_out, false);
 }
 
-/** Minimal wrapper that calls page_zip_decompress_low() 
-    and can be extended for “all” vs “some” parts. */
-static bool
-page_zip_decompress(page_zip_des_t* page_zip, byte* page_out) {
-    if (!page_zip || !page_out) return false;
-    return page_zip_decompress_low(page_zip, page_out);
-}
 /* ==================================================================== */
 /**************************************************************************/
 
@@ -224,28 +168,22 @@ void ShowIndexHeaderPossibleDecompress(uint32_t page_num, bool is_show_records) 
     return;
   }
 
-  // Check if page might be compressed:
   if (is_page_compressed(read_buf)) {
-    // 1) Build a page_zip_des_t
     page_zip_des_t zip;
-    zip.data = read_buf;     // compressed data is in read_buf
-    zip.ssize = kPageSize;   // Typically 16K. 
-                             // (In real code, you might store the "zip_size" from the InnoDB data dictionary.)
+    zip.data  = read_buf;
+    zip.ssize = kPageSize;  // or actual compressed length
 
-    // 2) Allocate a separate buffer for the uncompressed page
     byte* uncompressed_page = (byte*)malloc(kPageSize);
     if (!uncompressed_page) {
       printf("malloc for uncompressed_page failed\n");
       return;
     }
-
     memset(uncompressed_page, 0, kPageSize);
 
-    // 3) Try decompress
+    // Just call page_zip_decompress now:
     bool ok = page_zip_decompress(&zip, uncompressed_page);
     if (!ok) {
       printf("Decompression failed. Falling back to raw parse.\n");
-      // Just parse read_buf as-is
       free(uncompressed_page);
       ShowIndexHeader(page_num, is_show_records);
       return;
