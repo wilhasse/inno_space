@@ -12,7 +12,9 @@
 #endif
 
 /** Common InnoDB offsets. In real code, these come from `page0types.h`. */
-static const int FIL_PAGE_TYPE     = 24;
+#ifndef FIL_PAGE_TYPE
+#define FIL_PAGE_TYPE 24
+#endif
 static const int PAGE_HEADER       = 38;
 static const int PAGE_DATA         = 38;
 static const int PAGE_ZIP_START    = 99;  // Typically 99 in MySQL 8
@@ -20,8 +22,13 @@ static const int PAGE_NEW_INFIMUM  = 99;
 static const int PAGE_NEW_SUPREMUM = 113;
 
 /** Some placeholders. */
+#ifdef byte
+typedef byte page_byte_t;
+#else
 typedef unsigned char byte;
-typedef byte* page_t;
+typedef byte page_byte_t;
+#endif
+typedef page_byte_t* page_t;
 
 /** Minimal "compressed page descriptor." */
 typedef struct page_zip_des {
