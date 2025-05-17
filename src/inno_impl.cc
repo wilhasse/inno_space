@@ -32,6 +32,9 @@
 // ====================== DECOMPRESSION SNIPPET =======================
 #include <zlib.h>  // For inflate/deflate
 #include "zipdecompress_stub.h"
+#ifdef UNIV_PAGE_SIZE
+#undef UNIV_PAGE_SIZE
+#endif
 // ===================================================================
 
 #include "include/fil0fil.h"
